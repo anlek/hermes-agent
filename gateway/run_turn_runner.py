@@ -923,6 +923,10 @@ class TurnRunner:
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
         want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
         want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
+        external_turn = getattr(ctx.source, "_external_turn_force_non_streaming", False)
+        want_stream_deltas = want_stream_deltas and not external_turn
+        want_interim_messages = want_interim_messages and not external_turn
+        external_delta = getattr(ctx.source, "_external_turn_stream_delta_callback", None)
         if want_stream_deltas or want_interim_messages:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -964,14 +968,16 @@ class TurnRunner:
             ) if sc is not None
         ]
         stream_delta_cb = None
-        if delta_sinks:
+        if delta_sinks or callable(external_delta):
             def stream_delta_cb(text: Optional[str]) -> None:
                 if ctx._run_still_current():
                     for sink in delta_sinks:
                         sink.on_delta(text)
+                    if callable(external_delta):
+                        external_delta(text)
 
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-            if not ctx._run_still_current():
+            if not ctx._run_still_current() or external_turn:
                 return
             if stts is not None:
                 # Flush accepted deltas; completed commentary is a separate speech segment.

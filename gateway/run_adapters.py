@@ -1754,6 +1754,8 @@ class GatewayAdapterLifecycleMixin:
     def _create_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatformAdapter]:
         """Create an adapter bound to this runner (every lifecycle path goes through here so
         adapters can resolve inbound profile routes before handlers or connect())."""
+        if platform == Platform.API_SERVER:
+            config.extra["matrix_platform_turn_allowed_room_id"] = self.config.matrix_platform_turn_allowed_room_id
         adapter = self._instantiate_adapter(platform, config)
         if adapter is not None:
             adapter.gateway_runner = self

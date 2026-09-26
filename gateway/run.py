@@ -3368,12 +3368,15 @@ def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[Ba
     return adapter_cls(config)
 
 
+from gateway.run_external_turn import GatewayExternalTurnMixin
+
 class GatewayRunner(
     GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin,
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
-    GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
+    GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin,
+    GatewayExternalTurnMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.

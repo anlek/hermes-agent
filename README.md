@@ -32,6 +32,13 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 
 ---
 
+## Local Talk to Helix integration
+
+The native dictation apps use the dedicated Matrix turn endpoint. See
+[Talk to Helix operations](website/docs/developer-guide/talk-to-helix.md) for its contract, configuration,
+regression checks, and deployment verification. After gateway updates, run
+`scripts/check_talk_to_helix.sh` to catch a missing route before using the apps.
+
 ## Quick Install
 
 ### Linux, macOS, WSL2

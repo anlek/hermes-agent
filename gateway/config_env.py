@@ -652,3 +652,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to *config* (see ``_ENV_STEPS``)."""
     for step in _ENV_STEPS:
         step(config)
+    from gateway.config import MATRIX_PLATFORM_TURN_ALLOWED_ROOM_ID_ENV, resolve_matrix_platform_turn_allowed_room_id, _getenv
+    room = _getenv(MATRIX_PLATFORM_TURN_ALLOWED_ROOM_ID_ENV, None)
+    if room is not None:
+        config.matrix_platform_turn_allowed_room_id = resolve_matrix_platform_turn_allowed_room_id(room)

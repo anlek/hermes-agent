@@ -1164,6 +1164,9 @@ def _run_route_delegate(name: str):
     return _handler
 
 
+from gateway.config import DEFAULT_MATRIX_PLATFORM_TURN_ALLOWED_ROOM_ID
+from gateway.trusted_matrix_turn import TrustedMatrixTurnIngress, MATRIX_PLATFORM_TURN_INGRESS_KEY_ENV
+
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
@@ -1184,7 +1187,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_chat_completions = _admit_api_agent_request(OpenAICompatRoutesMixin._handle_chat_completions)
     _handle_responses = _admit_api_agent_request(OpenAICompatRoutesMixin._handle_responses)
 
-    def __init__(self, config: PlatformConfig):
+    def __init__(self, config: PlatformConfig, *, matrix_platform_turn_allowed_room_id=DEFAULT_MATRIX_PLATFORM_TURN_ALLOWED_ROOM_ID):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
         self._host, self._port = listen_address(extra)
@@ -1241,9 +1244,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # One memory provider per session across requests (this surface rebuilds the agent per turn).
         self._memory_sessions = ApiServerMemorySessions()
         self.gateway_runner: Optional[Any] = None  # set by gateway/run.py
+        self._trusted_matrix_turn_ingress = TrustedMatrixTurnIngress(
+            lambda: self.gateway_runner,
+            ingress_key=_get_scoped_secret(MATRIX_PLATFORM_TURN_INGRESS_KEY_ENV, ""),
+            api_server_key=self._api_key, allowed_room_id=extra.get("matrix_platform_turn_allowed_room_id", matrix_platform_turn_allowed_room_id),
+        )
+        self._pending_trusted_matrix_requests = 0
         # Admitted requests not yet in agent bookkeeping, so shutdown drain counts them.
         self._pending_agent_requests: int = 0
-# Shared broker; this adapter maps HTTP registration + controller WS onto it.
+        # Shared broker; this adapter maps HTTP registration + controller WS onto it.
         self._browser_control_broker = get_browser_control_broker()
         # One-shot artifact transport: lazy per-profile stores + limiter (tests inject).
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
@@ -1265,6 +1274,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         (task-based, since ``_active_run_agents`` has a queued-before-agent gap)."""
         try:
             return (int(getattr(self, "_pending_agent_requests", 0))
+                    + max(0, self._trusted_matrix_turn_ingress.inflight_count - self._pending_trusted_matrix_requests)
                     + int(self._inflight_agent_runs)
                     + sum(not task.done() for task in self._active_run_tasks.values()))
         except Exception:
@@ -1753,12 +1763,249 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
+        if self._trusted_matrix_turn_ingress.enabled:
+            routes.append(("POST", "/v1/platform-turns/matrix", self._handle_trusted_matrix_platform_turn))
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
         return routes
+
+    async def _handle_trusted_matrix_platform_turn(self, request: Any) -> Any:
+        """Authenticate and await one native Matrix turn as JSON or opt-in SSE."""
+        from gateway.trusted_matrix_turn import MAX_BODY_BYTES
+
+        def respond(status: int, body: dict[str, Any]) -> Any:
+            headers = {"Cache-Control": "no-store"}
+            if status == 401:
+                headers["WWW-Authenticate"] = "Bearer"
+            return web.json_response(body, status=status, headers=headers)
+
+        authorization = request.headers.get("Authorization", "")
+        if not self._trusted_matrix_turn_ingress.enabled:
+            return respond(
+                404,
+                {
+                    "ok": False,
+                    "error": {"code": "not_found", "message": "Not found."},
+                },
+            )
+        if not self._trusted_matrix_turn_ingress.is_authenticated(authorization):
+            return respond(
+                401,
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "unauthorized",
+                        "message": "Authentication failed.",
+                    },
+                },
+            )
+        if self._gateway_is_draining():
+            return respond(
+                503,
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "gateway_draining",
+                        "message": "Gateway is draining; retry later.",
+                    },
+                },
+            )
+
+        # Reserve this authenticated request before its first await so shutdown
+        # cannot miss the body-read -> ingress-task handoff window.
+        self._pending_agent_requests += 1
+        self._pending_trusted_matrix_requests += 1
+        try:
+            if (
+                request.content_length is not None
+                and request.content_length > MAX_BODY_BYTES
+            ):
+                return respond(
+                    413,
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "body_too_large",
+                            "message": "Request body is too large.",
+                        },
+                    },
+                )
+
+            raw_body = bytearray()
+            async for chunk in request.content.iter_chunked(8192):
+                if len(raw_body) + len(chunk) > MAX_BODY_BYTES:
+                    return respond(
+                        413,
+                        {
+                            "ok": False,
+                            "error": {
+                                "code": "body_too_large",
+                                "message": "Request body is too large.",
+                            },
+                        },
+                    )
+                raw_body.extend(chunk)
+            buffered_body = bytes(raw_body)
+            if self._trusted_matrix_turn_ingress.wants_stream(
+                buffered_body,
+                request.headers.get("Accept", ""),
+            ):
+                return await self._stream_trusted_matrix_platform_turn(
+                    request,
+                    authorization,
+                    buffered_body,
+                )
+            status, body = await self._trusted_matrix_turn_ingress.handle(
+                authorization,
+                buffered_body,
+            )
+            return respond(status, body)
+        finally:
+            self._pending_agent_requests = max(
+                0,
+                self._pending_agent_requests - 1,
+            )
+            self._pending_trusted_matrix_requests = max(
+                0,
+                self._pending_trusted_matrix_requests - 1,
+            )
+
+    async def _stream_trusted_matrix_platform_turn(
+        self,
+        request: Any,
+        authorization: str,
+        raw_body: bytes,
+    ) -> Any:
+        """Stream a trusted turn without tying native work to the HTTP client."""
+
+        assert web is not None
+        loop = asyncio.get_running_loop()
+        queue: "asyncio.Queue[tuple[str, Any]]" = asyncio.Queue()
+        consumer_attached = True
+
+        def enqueue_stream_event(event_name: str, data: str) -> None:
+            if (
+                not consumer_attached
+                or event_name not in {"delta", "replace"}
+                or not data
+            ):
+                return
+
+            def put() -> None:
+                if consumer_attached:
+                    queue.put_nowait((event_name, data))
+
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is loop:
+                put()
+            else:
+                try:
+                    loop.call_soon_threadsafe(put)
+                except RuntimeError:
+                    pass
+
+        async def run_turn() -> None:
+            try:
+                status, body = await self._trusted_matrix_turn_ingress.handle(
+                    authorization,
+                    raw_body,
+                    on_stream_event=enqueue_stream_event,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                status, body = 502, {
+                    "ok": False,
+                    "error": {
+                        "code": "turn_failed",
+                        "message": "Matrix turn failed.",
+                    },
+                }
+            await queue.put(("terminal", (status, body)))
+
+        turn_task = asyncio.create_task(run_turn())
+        try:
+            self._background_tasks.add(turn_task)
+        except (AttributeError, TypeError):
+            pass
+        turn_task.add_done_callback(
+            lambda task: getattr(self, "_background_tasks", set()).discard(task)
+        )
+
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-store",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        connection_errors = (
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+            OSError,
+        )
+
+        try:
+            await response.prepare(request)
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(
+                        queue.get(),
+                        timeout=(
+                            self._trusted_matrix_turn_ingress.stream_keepalive_seconds
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    await response.write(b": keepalive\n\n")
+                    continue
+
+                if kind in {"delta", "replace"}:
+                    await response.write(
+                        _sse_frame({"text": payload}, event=kind, ensure_ascii=False)
+                    )
+                    continue
+
+                status, body = payload
+                if status == 200 and body.get("ok") is True:
+                    event_name = "done"
+                    event_data = body
+                else:
+                    event_name = "error"
+                    error = body.get("error") if isinstance(body, dict) else None
+                    if not isinstance(error, dict):
+                        error = {
+                            "code": "turn_failed",
+                            "message": "Matrix turn failed.",
+                        }
+                    event_data = {
+                        "code": str(error.get("code") or "turn_failed"),
+                        "message": str(
+                            error.get("message") or "Matrix turn failed."
+                        ),
+                    }
+                await response.write(
+                    _sse_frame(event_data, event=event_name, ensure_ascii=False)
+                )
+                break
+        except connection_errors:
+            # The native turn is owned by turn_task. A disconnected caller only
+            # loses its HTTP subscription; idempotent Matrix work keeps running.
+            pass
+        finally:
+            consumer_attached = False
+            try:
+                await response.write_eof()
+            except connection_errors:
+                pass
+        return response
 
     # -- Session header helpers -------------------------------------------------------
 
@@ -4428,7 +4675,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # scopes config/credentials when multiplexing is on).
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
-                self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+                if path != "/v1/platform-turns/matrix":
+                    self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
             # Registered LAST so every native mirror above wins: anything else under /p/<profile>/ is a
             # secondary profile's inbound-port platform (Twilio, LINE, Teams, ...) served on this listener.
             self._app.router.add_route("*", "/p/{profile}/{tail:.*}", self._handle_profile_ingress)

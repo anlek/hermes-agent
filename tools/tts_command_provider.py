@@ -134,6 +134,7 @@ def command_failure_detail(exc: subprocess.CalledProcessError) -> str:
 
 def run_command_provider(
     command: str, timeout: float, env_passthrough: Optional[list] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> subprocess.CompletedProcess:
     """Run a command-provider shell command with process-tree idle cleanup.
     ``timeout`` is an IDLE timeout, reset whenever the command emits output — a slow-but-alive
@@ -175,7 +176,11 @@ def run_command_provider(
         reader.start()
     deadline = time.monotonic() + timeout
     timed_out = False
+    cancelled = False
     while open_streams:
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             timed_out = True
@@ -189,12 +194,18 @@ def run_command_provider(
             continue
         chunks[name].append(chunk)
         deadline = time.monotonic() + timeout
-    if not timed_out:
+    while not timed_out and not cancelled:
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        remaining = deadline - time.monotonic()
+        timed_out = remaining <= 0
+        if cancelled or timed_out:
+            break
         try:
-            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            proc.wait(timeout=min(0.05, remaining))
+            break
         except subprocess.TimeoutExpired:
-            timed_out = True
-    if timed_out:
+            continue
+    if timed_out or cancelled:
         terminate_command_process_tree(proc)
         for reader in readers:
             reader.join(timeout=0.5)
@@ -203,6 +214,8 @@ def run_command_provider(
             if chunk:
                 chunks[name].append(chunk)
     stdout, stderr = "".join(chunks["stdout"]), "".join(chunks["stderr"])
+    if cancelled:
+        raise InterruptedError("TTS command cancelled")
     if timed_out:
         raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr) from (
             subprocess.TimeoutExpired(command, timeout))
@@ -308,6 +321,7 @@ def _configured_command_tts_output_path(path: Path, config: Dict[str, Any]) -> P
 
 def _generate_command_tts(
     text: str, output_path: str, provider_name: str, config: Dict[str, Any], tts_config: Dict[str, Any],
+    cancel_event: Optional[threading.Event] = None,
 ) -> str:
     """Generate speech by running a user-configured shell command; returns the audio path it wrote.
     Raises ``ValueError`` for bad provider config, ``RuntimeError`` for timeouts / bad exits / no output."""
@@ -330,7 +344,7 @@ def _generate_command_tts(
         }
         command = render_command_template(command_template, placeholders)
         try:
-            run_command_provider(command, timeout, env_passthrough=command_env_passthrough(config))
+            run_command_provider(command, timeout, env_passthrough=command_env_passthrough(config), cancel_event=cancel_event)
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"TTS provider '{provider_name}' timed out after {timeout:g}s") from exc
         except subprocess.CalledProcessError as exc:

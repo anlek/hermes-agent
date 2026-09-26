@@ -2205,6 +2205,8 @@ DEFAULT_CONFIG = {
         # HERMES_MEDIA_TRUST_RECENT_SECONDS. Only consulted when strict is true.
         "trust_recent_files_seconds": 600,
         "api_server": {  # OpenAI-compatible API server platform (gateway/platforms/api_server.py).
+            # Talk to Helix: one encrypted native Matrix room; null disables ingress.
+            "matrix_platform_turn_allowed_room_id": "!mJbmeylVKgmcjSxWCC:eightstory.com",
             # Max concurrent agent runs. Requests to /v1/chat/completions, /v1/responses, and
             # /v1/runs beyond this get HTTP 429 + Retry-After, bounding CPU/memory/LLM-quota
             # exhaustion from a request flood. 0 = no cap.

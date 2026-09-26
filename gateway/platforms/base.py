@@ -2917,6 +2917,19 @@ class BasePlatformAdapter(ABC):
             return
         await self.stop_typing(chat_id)
 
+    @staticmethod
+    def _delivery_cancelled(metadata: Optional[Dict[str, Any]]) -> bool:
+        """Return whether an internal trusted delivery has been cancelled."""
+
+        cancel_check = (metadata or {}).get("_external_turn_cancel_check")
+        if not callable(cancel_check):
+            return False
+        try:
+            return bool(cancel_check())
+        except Exception:
+            logger.warning("Trusted delivery cancellation check failed", exc_info=True)
+            return True
+
     async def send_multiple_images(
         self, chat_id: str, images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
@@ -2929,6 +2942,8 @@ class BasePlatformAdapter(ABC):
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
+            if self._delivery_cancelled(metadata):
+                return
             try:
                 logger.info("[%s] Sending image: %s (alt=%s)", self.name,
                             safe_url_for_log(image_url), alt_text[:30] if alt_text else "")
@@ -3567,6 +3582,8 @@ class BasePlatformAdapter(ABC):
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
         async def _send(text: str) -> "SendResult":
+            if self._delivery_cancelled(metadata):
+                return SendResult(success=False, error="turn_cancelled")
             return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
         async def _send_again(previous: "SendResult") -> "Optional[SendResult]":
@@ -3675,9 +3692,8 @@ class BasePlatformAdapter(ABC):
         # Non-network / post-retry formatting failure: try plain text as fallback. A
         # rate-limited error never reaches here: it classifies as network above and the
         # loop only breaks on a non-transient, non-rate-limited error.
-        if self._is_partial_delivery(result):
-            # Part of a split payload is already on screen; a plain-text re-send of the whole would duplicate it.
-            logger.warning("[%s] Send failed after partial delivery: %s — not re-sending as plain text", self.name, error_str)
+        if self._is_partial_delivery(result) or callable((metadata or {}).get("_external_turn_cancel_check")):
+            # Avoid duplicating a partial send or altering the trusted turn's exact answer.
             return result
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
@@ -3741,7 +3757,9 @@ class BasePlatformAdapter(ABC):
         return result
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
-        """Return True when two text debounce events came from the same sender."""
+        """Merge same-sender native text, never mutate a fingerprinted HTTP turn."""
+        if any((candidate.metadata or {}).get("external_turn_request_id") for candidate in (existing, event)):
+            return False
 
         def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
             source = getattr(candidate, "source", None)
@@ -3916,7 +3934,9 @@ class BasePlatformAdapter(ABC):
             self._pending_messages.pop(session_key, None)
             self._discard_text_debounce(session_key)
         if release_guard:
-            self._release_session_guard(session_key)
+            replacement_owner = self._session_tasks.get(session_key)
+            if replacement_owner is None or replacement_owner is task:
+                self._release_session_guard(session_key)
 
     async def _drain_pending_after_session_command(
         self, session_key: str, command_guard: asyncio.Event) -> None:
@@ -4025,7 +4045,7 @@ class BasePlatformAdapter(ABC):
         # discarded.  Same shape as the /approve deadlock fix (PR #4926): agent thread
         # blocked on Event.wait, message must reach the resolver before being a new turn.
         # See #4926.
-        if not cmd and event.allow_gateway_control:
+        if not cmd and event.allow_gateway_control and not (event.internal and (event.metadata or {}).get("external_turn_request_id")):
             try:
                 from tools import clarify_gateway as _clarify_mod
                 _has_text_clarify = _clarify_mod.get_pending_for_session(
@@ -4235,7 +4255,7 @@ class BasePlatformAdapter(ABC):
                 result = await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
             else:
                 result = await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
-            if not result.success:
+            if not result.success and not self._delivery_cancelled(metadata):
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
                 await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=metadata)
@@ -4247,6 +4267,8 @@ class BasePlatformAdapter(ABC):
         for path, is_voice, media_tag in queue:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
+            if self._delivery_cancelled(metadata):
+                return
             try:
                 record_delivery(await _send_one(path, is_voice=is_voice, media_tag=media_tag))
             except Exception as err:
@@ -4304,21 +4326,39 @@ class BasePlatformAdapter(ABC):
 
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
-        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
-        """Normal-lane final: the ledger bracket plus the message-id owner's ephemeral delete."""
-        result, delivery_adapter = await self.send_final_ledgered(
-            event, session_key, text_content, metadata,
-            reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
+        is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> SendResult:
+        """Send the final text and report the result to the native turn lifecycle."""
+        external = (event.metadata or {}).get("external_turn_request_id")
+        if self._delivery_cancelled(metadata):
+            return SendResult(success=False, error="turn_cancelled")
+        if external:
+            delivery_adapter = self._final_delivery_adapter(event.source)
+            event.metadata["external_turn_delivery_started"] = True
+            try:
+                result = await delivery_adapter._send_with_retry(
+                    chat_id=event.source.chat_id, content=text_content,
+                    reply_to=_reply_anchor_for_event(event), metadata=metadata)
+            finally:
+                event.metadata["external_turn_delivery_finished"] = True
+        else:
+            result, delivery_adapter = await self.send_final_ledgered(
+                event, session_key, text_content, metadata,
+                reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+        return result
 
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
         a failing notice is logged, never raised). Returns the thread metadata used."""
         _thread_metadata = None
         try:
-            _thread_metadata = _thread_metadata_for_event(event)
+            _thread_metadata = dict(_thread_metadata_for_event(event) or {})
+            if (event.metadata or {}).get("external_turn_request_id"):
+                _thread_metadata["_external_turn_cancel_check"] = lambda: event.metadata.get("external_turn_cancelled", False)
+            if self._delivery_cancelled(_thread_metadata):
+                return _thread_metadata
             error_detail = str(e)[:300] if str(e) else "no details available"
             # Only the policy reads bind the routed profile; the send stays in the launch scope
             # as before, so delivery bookkeeping keeps landing where boot-time recovery reads it.
@@ -4344,6 +4384,8 @@ class BasePlatformAdapter(ABC):
         results feed ``record_delivery`` so the turn outcome reflects them."""
         human_delay = self._get_human_delay()
         images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
+        if self._delivery_cancelled(metadata):
+            return
         if images:
             logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
             await self._send_image_batch(event, images, metadata, human_delay, record_delivery)
@@ -4457,6 +4499,16 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        active_events = self.__dict__.setdefault("_active_session_events", {})
+        active_events[session_key] = event
+        external_request_id = (event.metadata or {}).get("external_turn_request_id")
+        external_error = "matrix_turn_incomplete"
+        external_result = None
+        external_answer = None
+
+        def cancelled():
+            return bool(external_request_id and event.metadata.get("external_turn_cancelled"))
+
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
 
         def _record_delivery(result):
@@ -4472,12 +4524,25 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
+            if cancelled():
+                return
+            if external_request_id:
+                from gateway.trusted_matrix_turn import ensure_external_turn_available, ExternalTurnUnavailable
+                try:
+                    ensure_external_turn_available(self.gateway_runner)
+                except ExternalTurnUnavailable as exc:
+                    external_error = exc.code
+                    return
             response = await self._message_handler(event)
+            if cancelled():
+                return
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
                 if diagnostic_wake_muted(event):
                     response = None
+            if external_request_id and not response:
+                external_error = "agent_no_response"
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
@@ -4494,6 +4559,10 @@ class BasePlatformAdapter(ABC):
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                if external_request_id:
+                    _final_thread_metadata["_external_turn_cancel_check"] = cancelled
+                if cancelled():
+                    return
                 _tts_paths, _tts_requested_path = [], None
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
@@ -4524,13 +4593,20 @@ class BasePlatformAdapter(ABC):
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
-                    await self._send_final_text(
+                    external_result = await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)
+                    external_answer = text_content
+                if cancelled():
+                    return
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
+                if external_request_id and not cancelled() and external_result is not None and external_result.success and external_result.message_id:
+                    self.gateway_runner._resolve_external_turn(event, answer=external_answer, reply_event_id=external_result.message_id)
+                elif external_request_id:
+                    external_error = "matrix_reply_delivery_failed"
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
@@ -4551,21 +4627,28 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            external_error = "turn_cancelled"
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            external_error = "agent_failed"
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
+            if not cancelled():
+                _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
+            if external_request_id:
+                self.gateway_runner._resolve_external_turn(event, error_code="turn_cancelled" if cancelled() else external_error)
+            if active_events.get(session_key) is event:
+                active_events.pop(session_key, None)
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)

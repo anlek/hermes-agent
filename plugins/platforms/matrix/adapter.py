@@ -773,8 +773,11 @@ def ensure_matrix_deps() -> bool:
 
 
 class _CryptoStateStore:
-    """StateStore shim for OlmMachine (MemoryStateStore lacks is_encrypted/get_encryption_info/
-    find_shared_rooms); falls back to a homeserver state query when the store has no info."""
+    """Olm state store with homeserver fallback for cold encryption caches.
+
+    Missing encryption state means plaintext only after an authoritative M_NOT_FOUND;
+    transport or permission failures must never downgrade encrypted delivery.
+    """
 
     def __init__(self, client_state_store: Any, joined_rooms: set, client=None):
         self._ss = client_state_store
@@ -793,15 +796,17 @@ class _CryptoStateStore:
         if room_id in self._enc_info_cache:
             return self._enc_info_cache[room_id]
         if self._client is None:
-            return None
+            raise RuntimeError("Room encryption state is unavailable")
         try:
             from mautrix.types import EventType as _ET, RoomEncryptionStateEventContent as _Enc, RoomID as _RID
             raw = await self._client.get_state_event(_RID(room_id), _ET.ROOM_ENCRYPTION)
         except Exception as exc:
-            logger.debug("Matrix: homeserver encryption-info query failed for %s: %s", room_id, exc)
-            return None
+            from mautrix.errors import MNotFound
+            if isinstance(exc, MNotFound):
+                return None
+            raise
         if not raw:
-            return None
+            raise RuntimeError("Invalid room encryption state")
         content = raw if isinstance(raw, _Enc) else _Enc.deserialize(
             raw.serialize() if hasattr(raw, "serialize") else raw)
         if hasattr(self._ss, "set_encryption_info"):
@@ -1402,10 +1407,14 @@ class MatrixAdapter(BasePlatformAdapter):
             return SendResult(success=True)
         last_event_id = None
         for chunk in self.truncate_message(self.format_message(content), self.max_message_length):
+            if self._delivery_cancelled(metadata):
+                return SendResult(success=False, error="turn_cancelled")
             msg_content = self._build_text_message_content(chunk)
             self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
             try:
                 last_event_id = await self._send_room_message(chat_id, msg_content)
+                if await self._redact_cancelled_delivery(chat_id, last_event_id, metadata):
+                    return SendResult(success=False, error="turn_cancelled")
                 logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
             except Exception as exc:
                 if not (self._encryption and getattr(self._client, "crypto", None)):
@@ -1413,7 +1422,11 @@ class MatrixAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=str(exc))
                 try:  # E2EE error: retry once after sharing keys
                     await self._client.crypto.share_keys()
+                    if self._delivery_cancelled(metadata):
+                        return SendResult(success=False, error="turn_cancelled")
                     last_event_id = await self._send_room_message(chat_id, msg_content)
+                    if await self._redact_cancelled_delivery(chat_id, last_event_id, metadata):
+                        return SendResult(success=False, error="turn_cancelled")
                     logger.info("Matrix: sent event %s to %s (after key share)", last_event_id, chat_id)
                 except Exception as retry_exc:
                     logger.error("Matrix: failed to send to %s after retry: %s", chat_id, retry_exc)
@@ -1590,6 +1603,8 @@ class MatrixAdapter(BasePlatformAdapter):
         for idx, (image_url, alt_text) in enumerate(images, start=1):
             if human_delay > 0 and idx > 1:
                 await asyncio.sleep(human_delay)
+            if self._delivery_cancelled(metadata):
+                return
             caption = f"{alt_text} ({idx}/{total})" if alt_text and total > 1 else (alt_text or None)
             if image_url.startswith("file://"):
                 result = await self.send_image_file(
@@ -1766,13 +1781,19 @@ class MatrixAdapter(BasePlatformAdapter):
             return self._media_too_large(len(data))
         upload_data = data
         encrypted_file = None
-        if await self._room_needs_encrypted_upload(room_id):
+        try:
+            encrypt = await self._room_needs_encrypted_upload(room_id)
+        except Exception:
+            return SendResult(success=False, error="room_encryption_state_unavailable")
+        if encrypt:
             try:
                 from mautrix.crypto.attachments import encrypt_attachment
                 upload_data, encrypted_file = encrypt_attachment(data)
             except Exception as exc:
                 logger.error("Matrix: attachment encryption failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
+        if self._delivery_cancelled(metadata):
+            return SendResult(success=False, error="turn_cancelled")
         try:
             mxc_url = await self._client.upload_media(
                 upload_data, mime_type=content_type, filename=filename, size=len(upload_data))
@@ -1794,19 +1815,21 @@ class MatrixAdapter(BasePlatformAdapter):
             if audio_metadata:
                 msg_content["org.matrix.msc1767.audio"] = audio_metadata
         self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
-        return await self._send_content_event(room_id, msg_content)
+        if self._delivery_cancelled(metadata):
+            return SendResult(success=False, error="turn_cancelled")
+        result = await self._send_content_event(room_id, msg_content)
+        if result.success and result.message_id and await self._redact_cancelled_delivery(room_id, result.message_id, metadata):
+            return SendResult(success=False, error="turn_cancelled")
+        return result
 
     async def _room_needs_encrypted_upload(self, room_id: str) -> bool:
         """E2EE on, Olm machine loaded, and the state store says the room is encrypted."""
         if not (self._encryption and getattr(self._client, "crypto", None)):
             return False
-        state_store = getattr(self._client, "state_store", None)
-        if not state_store:
-            return False
-        try:
-            return bool(await state_store.is_encrypted(RoomID(room_id)))
-        except Exception:
-            return False
+        state_store = getattr(self._client.crypto, "state_store", None)
+        if state_store is None:
+            raise RuntimeError("Room encryption state is unavailable")
+        return bool(await state_store.is_encrypted(RoomID(room_id)))
 
     def _media_too_large(self, size: int) -> SendResult:
         return SendResult(
@@ -2069,6 +2092,18 @@ class MatrixAdapter(BasePlatformAdapter):
                 body = quote_block + self._strip_mention(reply_text)
             else:
                 body = self._strip_mention(body)
+        thread_id, display_name, source = await self._build_native_message_source(
+            room_id=room_id, sender=sender, event_id=event_id, identity=identity,
+            is_dm=is_dm, thread_id=thread_id, is_mentioned=is_mentioned)
+        self._background_read_receipt(room_id, event_id)
+        return body, is_dm, chat_type, thread_id, display_name, source
+
+    async def _build_native_message_source(
+        self, *, room_id, sender, event_id, identity, is_dm, thread_id,
+        is_mentioned=False, user_name=None,
+    ):
+        """Build native and relayed sources with identical room/thread/profile policy."""
+        chat_type = "dm" if is_dm else "group"
         # Real thread roots are preserved above; synthetic roots (this event) follow policy: DM
         # @mention threads / DM auto-thread, or room auto-thread unless session_scope pins the room.
         if not thread_id:
@@ -2079,15 +2114,111 @@ class MatrixAdapter(BasePlatformAdapter):
                     self._matrix_session_scope != "room" and self._auto_thread)
             if synthetic:
                 thread_id = event_id
-        display_name = await self._get_display_name(room_id, sender)
+        display_name = user_name or await self._get_display_name(room_id, sender)
         source = self.build_source(
             chat_id=room_id, chat_name=identity.display_name, chat_type=chat_type, user_id=sender,
             user_name=display_name, thread_id=thread_id, chat_topic=identity.room_topic,
             guild_id=identity.server_name, parent_chat_id=room_id if thread_id else None, message_id=event_id)
         if thread_id:
             await self._threads.mark_async(thread_id)  # covers real roots and synthetic ones alike
-        self._background_read_receipt(room_id, event_id)
-        return body, is_dm, chat_type, thread_id, display_name, source
+        return thread_id, display_name, source
+
+    async def build_trusted_turn_source(
+        self,
+        *,
+        room_id: str,
+        sender: str,
+        event_id: str,
+        user_name: str,
+    ) -> Any:
+        """Build a trusted relay source in the same lane as native Matrix."""
+
+        identity = await self._resolve_room_identity(room_id)
+        is_dm = await self._is_dm_room(room_id)
+        _, _, source = await self._build_native_message_source(
+            room_id=room_id,
+            sender=sender,
+            event_id=event_id,
+            identity=identity,
+            is_dm=is_dm,
+            thread_id=None,
+            user_name=user_name,
+        )
+        return source
+
+    async def build_trusted_turn_preflight_source(
+        self,
+        *,
+        room_id: str,
+        sender: str,
+        user_name: str,
+    ) -> Any:
+        """Build a native-identity source for pre-send profile gating."""
+
+        identity = await self._resolve_room_identity(room_id)
+        is_dm = await self._is_dm_room(room_id)
+        return self.build_source(
+            chat_id=room_id,
+            chat_name=identity.display_name,
+            chat_type="dm" if is_dm else "group",
+            user_id=sender,
+            user_name=user_name,
+            chat_topic=identity.room_topic,
+            guild_id=identity.server_name,
+        )
+
+    async def trusted_turn_readiness(self, room_id: str) -> tuple[bool, Optional[str]]:
+        """Fail closed unless the live Matrix/Olm owner can serve this room."""
+        client = self._client
+        if not self.is_connected or client is None or self._closing:
+            return False, "matrix_disconnected"
+        if not self._encryption:
+            return False, "e2ee_disabled"
+        crypto = getattr(client, "crypto", None)
+        active_device_id = getattr(client, "device_id", None)
+        if (
+            crypto is None
+            or not active_device_id
+            or self._crypto_db is None
+        ):
+            return False, "olm_unavailable"
+        state_store = getattr(crypto, "state_store", None)
+        if state_store is None:
+            return False, "room_unencrypted"
+        try:
+            encrypted = bool(await state_store.is_encrypted(RoomID(room_id)))
+        except Exception:
+            return False, "room_unencrypted"
+        if not encrypted:
+            return False, "room_unencrypted"
+        return True, None
+
+    async def _redact_cancelled_delivery(
+        self,
+        room_id: str,
+        event_id: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Best-effort redact an event accepted as cancellation landed."""
+
+        if not self._delivery_cancelled(metadata):
+            return False
+        try:
+            await asyncio.wait_for(
+                self.redact_message(
+                    room_id,
+                    event_id,
+                    "Trusted platform turn cancelled",
+                ),
+                timeout=5.0,
+            )
+        except Exception:
+            logger.warning(
+                "Matrix: could not redact cancelled trusted delivery %s",
+                event_id,
+                exc_info=True,
+            )
+        return True
 
     async def _extract_reply_context(
         self, room_id: str, body: str, relates_to: dict

@@ -367,7 +367,9 @@ class GatewayBusySessionMixin:
         # ``merge_text=False``, which silently OVERWROTE the single pending slot when consecutive text
         # messages arrived in ``busy_input_mode: queue``.
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        same_security_context = existing is not None and (
+        same_security_context = existing is not None and not any(
+            (candidate.metadata or {}).get("external_turn_request_id") for candidate in (existing, event)
+        ) and (
             getattr(existing, "internal", False) == getattr(event, "internal", False)
             and getattr(existing, "allow_gateway_control", True)
             == getattr(event, "allow_gateway_control", True)
@@ -780,6 +782,12 @@ class GatewayBusySessionMixin:
             logger.debug("Failed to send busy-ack: %s", e)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        if (getattr(event, "internal", False) and (event.metadata or {}).get("external_turn_request_id")
+                and getattr(event.source, "_external_turn_force_non_streaming", False)):
+            self._queue_or_replace_pending_event(session_key, event)
+            if not getattr(event, "_gateway_accepted", False):
+                self._resolve_external_turn(event, error_code="matrix_turn_queue_full")
+            return True
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
         if event.internal and event.allow_gateway_control:
