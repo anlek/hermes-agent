@@ -1431,9 +1431,10 @@ class TestMatrixUploadAndSend:
         adapter = _make_adapter()
         adapter._encryption = True
         mock_client = MagicMock()
-        mock_client.crypto = object()
+        mock_client.crypto = types.SimpleNamespace()
         mock_client.state_store = MagicMock()
         mock_client.state_store.is_encrypted = AsyncMock(return_value=True)
+        mock_client.crypto.state_store = mock_client.state_store
         mock_client.upload_media = AsyncMock(return_value="mxc://example.org/enc")
         mock_client.send_message_event = AsyncMock(return_value="$event")
         adapter._client = mock_client

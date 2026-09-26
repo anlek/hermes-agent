@@ -851,7 +851,10 @@ class TurnRunner:
         want_stream_deltas = (
             scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
         )
-        want_interim_messages = ctx.interim_assistant_messages_enabled
+        external_turn = getattr(ctx.source, "_external_turn_force_non_streaming", False)
+        want_stream_deltas = want_stream_deltas and not external_turn
+        want_interim_messages = ctx.interim_assistant_messages_enabled and not external_turn
+        external_delta = getattr(ctx.source, "_external_turn_stream_delta_callback", None)
         if want_stream_deltas or want_interim_messages:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -875,14 +878,16 @@ class TurnRunner:
         # Deltas tee to the stream consumer (when text streaming is on) and to streaming TTS.
         delta_sinks = [sc for sc in ((stream_consumer if want_stream_deltas else None), stts) if sc is not None]
         stream_delta_cb = None
-        if delta_sinks:
+        if delta_sinks or callable(external_delta):
             def stream_delta_cb(text: str) -> None:
                 if ctx._run_still_current():
                     for sink in delta_sinks:
                         sink.on_delta(text)
+                    if callable(external_delta):
+                        external_delta(text)
 
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-            if not ctx._run_still_current():
+            if not ctx._run_still_current() or external_turn:
                 return
             if stream_consumer is not None:
                 stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)

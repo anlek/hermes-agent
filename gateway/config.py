@@ -22,6 +22,81 @@ from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
+import ipaddress
+import re
+
+DEFAULT_MATRIX_PLATFORM_TURN_ALLOWED_ROOM_ID = "!mJbmeylVKgmcjSxWCC:eightstory.com"
+MATRIX_PLATFORM_TURN_ALLOWED_ROOM_ID_ENV = "MATRIX_PLATFORM_TURN_ALLOWED_ROOM_ID"
+_DOMAINLESS_MATRIX_ROOM_ID_PATTERN = re.compile(r"^![A-Za-z0-9_-]{43}$")
+_MATRIX_DNS_NAME_PATTERN = re.compile(r"^[A-Za-z0-9.-]+$")
+_MATRIX_PORT_PATTERN = re.compile(r"^[0-9]{1,5}$")
+
+
+def _is_valid_matrix_server_name(value: str) -> bool:
+    """Validate the server-name grammar used by legacy Matrix room IDs."""
+    if value.startswith("["):
+        close_bracket = value.find("]")
+        if close_bracket <= 1:
+            return False
+        host = value[1:close_bracket]
+        suffix = value[close_bracket + 1 :]
+        if suffix and (
+            not suffix.startswith(":")
+            or not _MATRIX_PORT_PATTERN.fullmatch(suffix[1:])
+        ):
+            return False
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return False
+        return True
+
+    if value.count(":") > 1:
+        return False
+    host, separator, port = value.partition(":")
+    if separator and not _MATRIX_PORT_PATTERN.fullmatch(port):
+        return False
+    if not host or len(host) > 255:
+        return False
+    if host.count(".") == 3 and all(part.isdigit() for part in host.split(".")):
+        try:
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            return False
+        return True
+    if not _MATRIX_DNS_NAME_PATTERN.fullmatch(host):
+        return False
+    return all(
+        label
+        and len(label) <= 63
+        and not label.startswith("-")
+        and not label.endswith("-")
+        for label in host.split(".")
+    )
+
+
+def resolve_matrix_platform_turn_allowed_room_id(value: Any) -> Optional[str]:
+    """Return one valid Matrix room ID, or ``None`` to disable the route."""
+    if not isinstance(value, str) or value != value.strip():
+        return None
+    if not value.startswith("!") or "\x00" in value:
+        return None
+    try:
+        if len(value.encode("utf-8")) > 255:
+            return None
+    except UnicodeEncodeError:
+        return None
+
+    opaque_id = value[1:]
+    if ":" not in opaque_id:
+        return value if _DOMAINLESS_MATRIX_ROOM_ID_PATTERN.fullmatch(value) else None
+    localpart, server_name = opaque_id.split(":", 1)
+    if not localpart or not _is_valid_matrix_server_name(server_name):
+        return None
+    return value
+
+
+
 _TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSY_STRINGS = frozenset({"0", "false", "no", "off"})
 
@@ -579,6 +654,7 @@ class GatewayConfig:
     loop_watchdog_probe_timeout_s: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S
     loop_watchdog_max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
+    matrix_platform_turn_allowed_room_id: Optional[str] = DEFAULT_MATRIX_PLATFORM_TURN_ALLOWED_ROOM_ID
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
     # Prune SessionEntry records older than this (a resumed chat gets a fresh session). 0 = off.
     session_store_max_age_days: int = 90
@@ -591,10 +667,11 @@ class GatewayConfig:
         "max_concurrent_sessions", "multiplex_profiles", "multiplex_profile_allowlist",
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
-        "loop_watchdog_max_strikes", "unauthorized_dm_behavior",
+        "loop_watchdog_max_strikes", "unauthorized_dm_behavior", "matrix_platform_turn_allowed_room_id",
     )
 
     def __post_init__(self) -> None:
+        self.matrix_platform_turn_allowed_room_id = resolve_matrix_platform_turn_allowed_room_id(self.matrix_platform_turn_allowed_room_id)
         self.multiplex_profile_allowlist = _normalize_multiplex_profile_allowlist(self.multiplex_profile_allowlist)
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(self.systemd_watchdog_seconds)
 
@@ -740,6 +817,7 @@ class GatewayConfig:
             loop_watchdog_max_strikes=max_strikes,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), {"pair", "ignore"}, "pair"),
+            matrix_platform_turn_allowed_room_id=data.get("matrix_platform_turn_allowed_room_id", DEFAULT_MATRIX_PLATFORM_TURN_ALLOWED_ROOM_ID),
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),

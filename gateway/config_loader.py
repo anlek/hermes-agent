@@ -352,6 +352,9 @@ def load_yaml_layer(home: Path, gw_data: dict) -> None:
 
     gateway_section = yaml_cfg.get("gateway")
     bridge_toplevel_keys(yaml_cfg, gateway_section, gw_data)
+    api_config = (gateway_section or {}).get("api_server", {}) if isinstance(gateway_section, dict) else {}
+    if isinstance(api_config, dict) and "matrix_platform_turn_allowed_room_id" in api_config:
+        gw_data["matrix_platform_turn_allowed_room_id"] = api_config["matrix_platform_turn_allowed_room_id"]
     gateway_platforms = gateway_section.get("platforms") if isinstance(gateway_section, dict) else None
     platforms_data = merge_platform_sections(yaml_cfg, gateway_section, gw_data)
 

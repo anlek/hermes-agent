@@ -3292,10 +3292,18 @@ class GatewayTurnMixin:
         pending_event = None
         pending = None
         if result and adapter and session_key:
-            pending_event = _dequeue_pending_event(adapter, session_key)
-            # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
-            # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
-            pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            if getattr(source, "_external_turn_force_non_streaming", False):
+                if session_key not in adapter._pending_messages:
+                    queued = self._promote_queued_event(session_key, adapter, None)
+                    if queued is not None:
+                        adapter._pending_messages[session_key] = queued
+            else:
+                pending_event = _dequeue_pending_event(adapter, session_key)
+                if pending_event and getattr(pending_event.source, "_external_turn_force_non_streaming", False):
+                    adapter._pending_messages[session_key] = pending_event
+                    pending_event = None
+                else:
+                    pending_event = self._promote_queued_event(session_key, adapter, pending_event)
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
