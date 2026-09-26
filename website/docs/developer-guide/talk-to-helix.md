@@ -82,3 +82,46 @@ FIFO slots, `run_turn` leaves these turns to native adapter delivery, and
 Admission receipts and completion after attachment delivery are regression tested.
 The running upstream checkout had no Matrix turn route; the older restoration
 commits were not ancestors of its revision.
+
+## Why the Studio runs a fork, and how updates work now
+
+The route lived only as local commits on a checkout of `NousResearch/hermes-agent`.
+`hermes update` does `git reset --hard origin/main` when the checkout is on `main` and
+history has diverged, which silently deleted the feature three times
+(2026-08-03, 2026-08-19, 2026-09-22; each time the iPhone showed "HTTP 404").
+
+Since 2026-09-26 the Studio checkout's `origin` is the fork
+`git@github.com:anlek/hermes-agent.git`, and the feature is on that fork's `main`.
+`upstream` is `NousResearch/hermes-agent`. Consequences:
+
+- `hermes update` fast-forwards from the fork's `main`. It can no longer remove the
+  feature, because the feature *is* origin/main. When the fork is ahead of upstream the
+  updater prints "Your fork has N commit(s) not on upstream. Skipping upstream sync";
+  that line is expected.
+- Upstream changes reach the fork only through `scripts/sync_upstream_fork.sh`
+  (Hermes cron job "Hermes fork sync", daily, no-agent). It merges `upstream/main` into
+  the fork's `main` in the worktree `~/code/helix/hermes-fork-sync`, runs the Talk to
+  Helix tests, and pushes only if they pass. A conflict or test failure changes nothing
+  and posts a notice to Matrix; the merge is then finished by hand on branch `fork-sync`.
+- After a successful sync, deploy as usual: `hermes update` (or the `/update` command),
+  which restarts the gateway.
+- The Hermes cron job "Talk to Helix route watchdog" (hourly, no-agent) runs
+  `scripts/check_talk_to_helix.sh` and posts to Matrix only when the route stops
+  answering 401 to an unauthenticated request, or when the last fork sync failed.
+
+### If the route ever 404s again
+
+```sh
+cd ~/code/helix/hermes-agent
+git remote -v                 # origin MUST be github.com/anlek/hermes-agent
+git branch --show-current     # MUST be main
+git log --oneline -1 origin/main
+git ls-tree HEAD gateway/trusted_matrix_turn.py   # empty => feature missing from HEAD
+git fetch origin && git checkout main && git reset --hard origin/main
+launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway
+scripts/check_talk_to_helix.sh   # expects HTTP 401
+```
+
+If `origin` points at NousResearch again, someone re-cloned or edited remotes:
+`git remote set-url origin git@github.com:anlek/hermes-agent.git` and repeat the steps.
+The Studio pushes to the fork as the GitHub user `helix-anlek` (collaborator with push).
