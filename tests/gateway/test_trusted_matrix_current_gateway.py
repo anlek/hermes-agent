@@ -87,6 +87,8 @@ async def test_native_client_contract_through_registered_http_route(
             user_config={},
             resolve_display_setting=lambda *_args: True,
             interim_assistant_messages_enabled=True,
+            mute_notification_reply=False,
+            scheduled_heartbeat=False,
             _run_still_current=lambda: True,
         )
         consumer, delta, interim, want_interim = TurnRunner(

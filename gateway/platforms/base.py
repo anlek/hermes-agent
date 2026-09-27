@@ -3692,8 +3692,12 @@ class BasePlatformAdapter(ABC):
         # Non-network / post-retry formatting failure: try plain text as fallback. A
         # rate-limited error never reaches here: it classifies as network above and the
         # loop only breaks on a non-transient, non-rate-limited error.
-        if self._is_partial_delivery(result) or callable((metadata or {}).get("_external_turn_cancel_check")):
-            # Avoid duplicating a partial send or altering the trusted turn's exact answer.
+        if self._is_partial_delivery(result):
+            # Part of a split payload is already on screen; a plain-text re-send of the whole would duplicate it.
+            logger.warning("[%s] Send failed after partial delivery: %s — not re-sending as plain text", self.name, error_str)
+            return result
+        if callable((metadata or {}).get("_external_turn_cancel_check")):
+            # A trusted Talk to Helix turn must deliver its exact answer or nothing; no plain-text rewrite.
             return result
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
