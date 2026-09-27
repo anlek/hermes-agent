@@ -1,0 +1,29 @@
+--- a/python-olm-3.2.16/libolm/include/olm/list.hh	2023-11-23 10:39:07
++++ b/a/python-olm-3.2.16/libolm/include/olm/list.hh	2026-09-26 17:27:03
+@@ -99,7 +99,7 @@
+             return *this;
+         }
+         T * this_pos = _data;
+-        T * const other_pos = other._data;
++        T * other_pos = other._data;
+         while (other_pos != other._end) {
+             *this_pos = *other;
+             ++this_pos;
+--- a/python-olm-3.2.16/libolm/include/olm/olm_export.h	2023-11-23 10:39:15
++++ b/a/python-olm-3.2.16/libolm/include/olm/olm_export.h	2026-09-26 17:27:03
+@@ -33,6 +33,7 @@
+ #  define OLM_DEPRECATED_NO_EXPORT OLM_NO_EXPORT OLM_DEPRECATED
+ #endif
+ 
++/* NOLINTNEXTLINE(readability-avoid-unconditional-preprocessor-if) */
+ #if 0 /* DEFINE_NO_DEPRECATED */
+ #  ifndef OLM_NO_DEPRECATED
+ #    define OLM_NO_DEPRECATED
+--- a/python-olm-3.2.16/libolm/CMakeLists.txt	2023-11-23 10:39:07
++++ b/a/python-olm-3.2.16/libolm/CMakeLists.txt	2026-09-26 17:28:17
+@@ -1,4 +1,4 @@
+-cmake_minimum_required(VERSION 3.4)
++cmake_minimum_required(VERSION 3.5)
+ 
+ project(olm VERSION 3.2.16 LANGUAGES CXX C)
+ 

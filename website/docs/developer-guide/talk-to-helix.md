@@ -109,6 +109,15 @@ Since 2026-09-26 the Studio checkout's `origin` is the fork
   `scripts/check_talk_to_helix.sh` and posts to Matrix only when the route stops
   answering 401 to an unauthenticated request, or when the last fork sync failed.
 
+### Matrix on macOS
+
+The fork also enables the `matrix` extra on macOS. Its `python-olm` dependency
+comes from a [patched fork release](https://github.com/anlek/hermes-agent/releases/tag/python-olm-3.2.16-macos.1)
+because the PyPI sdist fails with current Apple clang and CMake. Linux keeps the
+PyPI package; Windows remains gated off. A future `python-olm` bump needs a new
+patched release asset, an updated source URL in `pyproject.toml`, and `uv lock`.
+The patch and rebuild instructions live in `scripts/macos/python-olm/README.md`.
+
 ### If the route ever 404s again
 
 ```sh
