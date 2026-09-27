@@ -134,3 +134,8 @@ scripts/check_talk_to_helix.sh   # expects HTTP 401
 If `origin` points at NousResearch again, someone re-cloned or edited remotes:
 `git remote set-url origin git@github.com:anlek/hermes-agent.git` and repeat the steps.
 The Studio pushes to the fork as the GitHub user `helix-anlek` (collaborator with push).
+
+After a fresh install or if the gateway log says "Platform 'Matrix' requirements not met",
+run `hermes pm install --extra matrix` once and restart the gateway; `pm` records the extra
+and keeps it through later `hermes update` runs. Verified 2026-09-26: Matrix connected for
+all profiles and the route answered 200 with a Matrix reply event.
