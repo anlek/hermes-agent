@@ -31,6 +31,8 @@ def _fake_mautrix_types():
 @pytest.fixture
 def fresh_dependency_boundary(monkeypatch):
     """Exercise the real importer after PM admits the SDK."""
+    # Exercise the missing-dependency branch even when the test env has Matrix installed.
+    monkeypatch.setattr(pm_extras, "missing", lambda extra: ("mautrix",))
     monkeypatch.setattr(pm_extras, "ensure_import", lambda *a, **kw: None)
     monkeypatch.delenv("MATRIX_E2EE_MODE", raising=False)
     monkeypatch.delenv("MATRIX_ENCRYPTION", raising=False)
