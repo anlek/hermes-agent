@@ -2078,7 +2078,8 @@ class MatrixAdapter(BasePlatformAdapter):
             if self._require_mention and not is_free_room and not in_bot_thread:
                 if not is_mentioned and not body.startswith("/"):
                     if voice_gate is not None:  # parkable voice: a bare @mention may follow (Element X)
-                        self._parked_voices.park(room_id, sender, voice_gate, event_id, source_content, relates_to)
+                        self._parked_voices.park(
+                            room_id, sender, voice_gate, event_id, source_content, relates_to, thread_id=thread_id)
                     logger.debug(
                         "Matrix: ignoring message %s in %s — no @mention "
                         "(set MATRIX_REQUIRE_MENTION=false to disable)", event_id, room_id)
@@ -2102,7 +2103,7 @@ class MatrixAdapter(BasePlatformAdapter):
             else:
                 body = self._strip_mention(body)
         if voice_gate is not None:  # source construction may await display-name lookup or thread persistence
-            self._parked_voices.release(room_id, sender, voice_gate)
+            self._parked_voices.release(room_id, sender, voice_gate, thread_id=thread_id)
         thread_id, display_name, source = await self._build_native_message_source(
             room_id=room_id, sender=sender, event_id=event_id, identity=identity,
             is_dm=is_dm, thread_id=thread_id, is_mentioned=is_mentioned)
@@ -2283,11 +2284,12 @@ class MatrixAdapter(BasePlatformAdapter):
             return
         # Dict lookup first: the mention regexes only run when a voice is parked or being gated
         # (both only happen under require_mention).
-        if (self._parked_voices.pending(room_id, sender)
+        thread_id = _thread_root(relates_to)
+        if (self._parked_voices.pending(room_id, sender, thread_id=thread_id)
                 and not self._strip_mention(body).strip() and self._content_mentions_bot(body, source_content)):
             limit = self._parked_voices.mark()  # never claim a voice sent after this mention
-            await self._parked_voices.settle(room_id, sender)  # same-/sync-batch voice still gating
-            parked = self._parked_voices.claim(room_id, sender, before=limit)
+            await self._parked_voices.settle(room_id, sender, thread_id=thread_id)  # same-/sync-batch voice still gating
+            parked = self._parked_voices.claim(room_id, sender, before=limit, thread_id=thread_id)
             if parked:  # answer the voice this bare mention was typed for, not an empty text
                 voice_id, voice_content, voice_relates = parked
                 await self._handle_media_message(
@@ -2336,7 +2338,8 @@ class MatrixAdapter(BasePlatformAdapter):
         # Gate (require_mention / allowed rooms) BEFORE the download: an unmentioned or
         # non-allowlisted room must not pull media onto the host only to drop it.
         # First await: mark a voice that may park in-flight so a concurrent bare mention waits for it.
-        gate = self._parked_voices.begin(room_id, sender) if self._voice_may_park(
+        thread_id = _thread_root(relates_to)
+        gate = self._parked_voices.begin(room_id, sender, thread_id=thread_id) if self._voice_may_park(
             room_id, body, source_content, relates_to, mention_claimed) else None
         try:
             ctx = await self._resolve_message_context(
@@ -2344,7 +2347,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 voice_gate=gate)
         finally:
             if gate is not None:
-                self._parked_voices.release(room_id, sender, gate)
+                self._parked_voices.release(room_id, sender, gate, thread_id=thread_id)
         if ctx is None:
             return
         # Cache locally so downstream tools get a real file path.
