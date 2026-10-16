@@ -16,7 +16,8 @@ from gateway.platforms.api_server import APIServerAdapter
 from gateway.run import GatewayRunner
 from gateway.run_turn_runner import TurnRunner
 from gateway.trusted_matrix_turn import HELIX_SUPPORT_ROOM_ID, ExternalTurnUnavailable
-from plugins.platforms.matrix.adapter import MatrixAdapter, _CryptoStateStore
+from plugins.platforms.matrix.adapter import MatrixAdapter
+from plugins.platforms.matrix.adapter_crypto import _CryptoStateStore
 from mautrix.client.state_store.memory import MemoryStateStore
 
 KEY = "dictation-test-ingress-key-32-bytes-long"

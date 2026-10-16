@@ -2592,7 +2592,7 @@ async def test_matrix_text_delivery_rechecks_cancellation_between_chunks(monkeyp
     monkeypatch.setattr(
         adapter,
         "truncate_message",
-        lambda _content, _limit, _len_fn=None: ["first", "second"],
+        lambda _content, _limit, len_fn=None: ["first", "second"],
     )
     adapter.max_message_length = 16_000
     monkeypatch.setattr(
