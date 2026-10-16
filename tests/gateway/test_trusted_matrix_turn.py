@@ -2820,3 +2820,28 @@ async def test_cancel_session_processing_does_not_release_replacement_owner_guar
         replacement_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await replacement_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trusted_source", [False, True])
+async def test_compression_exhausted_turn_defers_trusted_queued_head(trusted_source):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._draining = False
+    source = SessionSource(platform=Platform.MATRIX, chat_id="!room:example.org",
+                           user_id="@user:example.org", chat_type="group")
+    if trusted_source:
+        source._external_turn_force_non_streaming = True
+    head_source = SessionSource(platform=Platform.MATRIX, chat_id=source.chat_id,
+                                user_id=source.user_id, chat_type="group")
+    head_source._external_turn_force_non_streaming = True
+    head = MessageEvent(text="queued request", source=head_source)
+    adapter = SimpleNamespace(_pending_messages={"key": head})
+    adapter.get_pending_message = lambda key: adapter._pending_messages.pop(key, None)
+    result = {"failed": True, "compression_exhausted": True, "pending_steer": "accepted steer"}
+
+    assert await runner._run_agent_drain_pending(result, adapter, source, "key") == (None, None)
+    # The steer takes the head slot for the fresh session; the trusted request queues behind it.
+    assert adapter._pending_messages["key"].text == "accepted steer"
+    assert runner._session_state("key").conversation.queued_events[0] is head
