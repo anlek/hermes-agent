@@ -98,11 +98,22 @@ Since 2026-09-26 the Studio checkout's `origin` is the fork
   feature, because the feature *is* origin/main. When the fork is ahead of upstream the
   updater prints "Your fork has N commit(s) not on upstream. Skipping upstream sync";
   that line is expected.
-- Upstream changes reach the fork only through `scripts/sync_upstream_fork.sh`
-  (Hermes cron job "Hermes fork sync", daily, no-agent). It merges `upstream/main` into
-  the fork's `main` in the worktree `~/code/helix/hermes-fork-sync`, runs the Talk to
-  Helix tests, and pushes only if they pass. A conflict or test failure changes nothing
-  and posts a notice to Matrix; the merge is then finished by hand on branch `fork-sync`.
+- Upstream changes reach the fork only through `scripts/sync_upstream_fork.sh`, run
+  nightly at 04:25 by the Studio's MyFleet update job (`scripts/nightly-update.sh` in the
+  MyFleet repo), which then runs `hermes update`. It merges `upstream/main` into the
+  fork's `main` in the worktree `~/code/helix/hermes-fork-sync`, runs the Talk to Helix
+  tests, and pushes only if they pass. A conflict or test failure changes nothing and is
+  reported by the nightly job; the merge is then finished by hand on branch `fork-sync`.
+- Merging by hand after a conflict (the script aborts its merge, so start it again): in
+  `~/code/helix/hermes-fork-sync`, run `git fetch origin main && git fetch upstream main`,
+  `git checkout -B fork-sync origin/main`, then `git merge --no-ff upstream/main`.
+  Resolve and `git add` each conflict; for `uv.lock`, take upstream's copy and relock with
+  upstream CI's pinned uv (`uvx uv@<version from .github/workflows/tests.yml> lock`;
+  newer uv can fail the android split). Run the script's Talk to Helix tests, commit
+  (with `LEFTHOOK=0` if upstream's lint hooks can't run on the Studio; lint the changed
+  files yourself), and `git push origin fork-sync:main`. The nightly job leaves
+  `fork-sync` alone while it holds a merge, edits or unpushed commits, so the push is
+  what hands it back to automation.
 - After a successful sync, deploy as usual: `hermes update` (or the `/update` command),
   which restarts the gateway.
 - The Hermes cron job "Talk to Helix route watchdog" (hourly, no-agent) runs
