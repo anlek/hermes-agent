@@ -3,7 +3,13 @@ projection. Bodies are rebound onto server.py's globals (method_ctx.bind_module)
 
 from __future__ import annotations
 
+import json
+import logging
+
 from .method_ctx import bind_module
+
+# Bound copies resolve these on server.py; the module's own (imported directly) needs them too.
+logger = logging.getLogger(__name__)
 
 # Verbose tool text is capped to the Ink render budget (a hair more, so the "[omitted …]" label
 # stays informative): unbounded output fed a render-tree blowup that OOM-killed the TUI parent.
@@ -364,6 +370,10 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     # every client reconcile without parsing tool args.
     if todo_state is not None:
         _emit("todo.updated", sid, todo_state)
+    # A tool (a plugin adding goal criteria, parking the goal) can move automation state mid-turn: repaint
+    # the cards now, not at turn end. Revision-gated, so an ordinary tool emits nothing.
+    if session is not None:
+        _publish_session_control_snapshot(sid, session, only_if_changed=True)
 
 
 # ── _on_tool_progress dispatch: each handler takes (sid, name, preview, kw) ─────────────────────
