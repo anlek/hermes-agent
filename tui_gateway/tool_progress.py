@@ -362,9 +362,10 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         payload.update(todo_state)
         if session is not None:
             _cache_todo_state(session, todo_state)
+    from agent.display import is_neutral_failure
     if (_tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name)
             or is_todo_tool_name(name) or _connector_tool_lifecycle(name, args)
-            or _tool_result_needs_user(result)):
+            or (_tool_result_needs_user(result) and not is_neutral_failure(name, result))):
         _emit_tool_lifecycle("tool.complete", sid, name, args, payload)
     # Task state is application data, not tool-progress chrome: a dedicated full-snapshot event lets
     # every client reconcile without parsing tool args.
@@ -379,6 +380,13 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
 # ── _on_tool_progress dispatch: each handler takes (sid, name, preview, kw) ─────────────────────
 # `tool.started` is dropped on purpose: _on_tool_start already emits the authoritative tool.start with
 # the stable id and args; an id-less duplicate row makes the desktop live view diverge from history.
+
+def _progress_tool_progress(sid, name, preview, kw):
+    # Live MCP progress on a running tool row: tool chrome, so it follows display.tool_progress.
+    if _tool_progress_enabled(sid):
+        from agent.tool_progress_relay import tool_progress_payload
+        _emit("tool.progress", sid, tool_progress_payload(name, preview, kw))
+
 
 def _progress_output_risk(sid, name, preview, kw):
     # A risk badge on a tool row: tool chrome, so it follows display.tool_progress.
@@ -494,7 +502,8 @@ def _progress_subagent(sid: str, name: str, preview, kw, event_type):
 # event_type -> (handler, requires): `requires` names the arg that must be truthy for the row to be
 # emitted at all ("name" / "preview" / None).
 _PROGRESS_HANDLERS = {
-    "tool.output_risk": (_progress_output_risk, "name"), "reasoning.available": (_progress_reasoning, "preview"),
+    "tool.output_risk": (_progress_output_risk, "name"), "tool.progress": (_progress_tool_progress, "name"),
+    "reasoning.available": (_progress_reasoning, "preview"),
     "moa.reference": (_progress_moa_reference, "name"),
     # Answer-only drops MoA content (references, progress/phase lines that land in the reasoning
     # disclosure or activity log) but keeps this: a bare state transition both clients use only
