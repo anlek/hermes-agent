@@ -828,7 +828,6 @@ async def test_matrix_trusted_source_uses_native_room_identity_and_thread_policy
     monkeypatch,
 ):
     from plugins.platforms.matrix.adapter import MatrixAdapter
-
     adapter = object.__new__(MatrixAdapter)
     adapter.platform = Platform.MATRIX
     adapter.gateway_runner = None
@@ -836,6 +835,7 @@ async def test_matrix_trusted_source_uses_native_room_identity_and_thread_policy
     adapter._free_rooms = set()
     adapter._require_mention = False
     adapter._thread_require_mention = False
+    adapter._strict_mention_rooms = set()
     adapter._dm_mention_threads = False
     adapter._dm_auto_thread = True
     adapter._matrix_session_scope = "auto"
@@ -1307,7 +1307,7 @@ async def test_runner_external_turn_rejects_non_default_profile_route():
     runner = object.__new__(GatewayRunner)
     runner.__dict__["_profile_name_for_source"] = lambda _source, **_kwargs: "private"
     adapter = MatrixAdapter()
-    setattr(adapter, "gateway_runner", runner)
+    vars(adapter)["gateway_runner"] = runner
     runner.__dict__["adapters"] = {Platform.MATRIX: adapter}
     event = MessageEvent(
         text="hello",
@@ -1476,7 +1476,7 @@ async def test_busy_trusted_turns_queue_as_distinct_fifo_session_turns():
             chat_type="group",
             user_id=ANDREW_MATRIX_USER_ID,
         )
-        setattr(source, "_external_turn_force_non_streaming", True)
+        vars(source)["_external_turn_force_non_streaming"] = True
         return MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
@@ -1560,7 +1560,7 @@ async def test_concurrent_trusted_turns_execute_sequentially_with_exact_event_id
             return SendResult(success=True, message_id=event_id)
 
     adapter = Adapter()
-    setattr(adapter, "gateway_runner", runner)
+    vars(adapter)["gateway_runner"] = runner
     runner.__dict__["adapters"] = {Platform.MATRIX: adapter}
     runner.__dict__["_delivery_adapter_for"] = lambda _source: adapter
     adapter._busy_session_handler = runner._handle_active_session_busy_message
