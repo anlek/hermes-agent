@@ -26,12 +26,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _CHILD_PROBE = r"""
 import json, os, sys
 sys.path.insert(0, {repo!r})
+import hermes_state as hs
 import hermes_state_guard
 fired = False
 try:
-    import hermes_state as hs
     hs._ensure_test_isolation(hs._real_platform_state_root() / "state.db")
-except RuntimeError:  # the DB guard, or the home guard refusing the live root at import
+except RuntimeError:
     fired = True
 print(json.dumps({{
     "armed": hermes_state_guard._running_under_pytest(),
@@ -41,7 +41,11 @@ print(json.dumps({{
 
 
 def _spawn_probe(env: dict) -> dict:
-    """Run the guard probe in a real child process with exactly *env*."""
+    """Run the guard probe in a real child process with exactly *env*.
+
+    The live-home guard would refuse first, at import; it is switched off so this pins the DB guard.
+    """
+    env = {**env, "HERMES_LIVE_HOME_GUARD_BYPASS": "1"}
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD_PROBE.format(repo=str(REPO_ROOT))],
         capture_output=True,

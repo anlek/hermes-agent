@@ -39,11 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _CHILD_PROBE = """
 import sys
 sys.path.insert(0, {repo!r})
-try:
-    import hermes_state
-except RuntimeError:  # the home guard refused the live root before the DB guard was reached
-    print("REFUSED")
-    sys.exit(0)
+import hermes_state
 
 root = hermes_state._real_platform_state_root()
 if root is None:
@@ -76,6 +72,8 @@ def _scrubbed_env(**overrides):
 
 
 def _run_probe(env):
+    # The live-home guard would refuse first, at import; switched off so this pins the DB guard.
+    env = {**env, "HERMES_LIVE_HOME_GUARD_BYPASS": "1"}
     result = subprocess.run(
         [sys.executable, "-c", _CHILD_PROBE.format(repo=str(REPO_ROOT))],
         env=env,

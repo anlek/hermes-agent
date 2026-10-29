@@ -69,14 +69,15 @@ class TestProductionPathRefused:
         ``_default_db_path()`` resolves the production DB.
         """
         monkeypatch.setenv("HERMES_HOME", str(REAL_ROOT))
+        # The live-home guard would refuse first; switched off so this pins the DB guard.
+        monkeypatch.setenv("HERMES_LIVE_HOME_GUARD_BYPASS", "1")
         # Neutralize the conftest's DEFAULT_DB_PATH re-pin so the default
         # resolver follows the (production-pointing) env, as it would in a
         # process that never imported the hermetic conftest.
         monkeypatch.setattr(
             hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
         )
-        # Either guard may refuse first: the home guard when the path is resolved, the DB guard on open.
-        with pytest.raises(RuntimeError, match="live-system guard|live Hermes home"):
+        with pytest.raises(RuntimeError, match="live-system guard"):
             SessionDB()
 
 
@@ -156,6 +157,7 @@ class TestSubprocessChildCovered:
             if k not in ("HERMES_HOME", "PYTEST_PLUGINS", "PYTHONPATH")
         }
         env["PYTEST_CURRENT_TEST"] = "tests/fake.py::test_child (call)"
+        env["HERMES_LIVE_HOME_GUARD_BYPASS"] = "1"  # pin the DB guard; the home guard would refuse first
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
         code = (
             "from hermes_state import SessionDB\n"
@@ -170,8 +172,7 @@ class TestSubprocessChildCovered:
             check=False,
         )
         assert proc.returncode != 0
-        # The home guard refuses at import, before the DB guard is reached.
-        assert "live-system guard" in proc.stderr or "live Hermes home" in proc.stderr
+        assert "live-system guard" in proc.stderr
 
     def test_child_with_tmp_hermes_home_succeeds(self, tmp_path):
         """Same child, hermetic HERMES_HOME: must work — no false positive."""

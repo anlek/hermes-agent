@@ -234,11 +234,19 @@ def reset_hermes_home_key_cache() -> None:
     _HOME_KEY_CACHE.clear()
 
 
-#: Set in a test process: pytest's own variables, and the marker tests/conftest.py exports.
+#: Test-process signals, as in hermes_state_guard._running_under_pytest (not imported: this module stays
+#: stdlib-only, the launcher and repair paths run it alone): pytest's variables and the conftest marker.
 _TEST_PROCESS_ENV = ("PYTEST_CURRENT_TEST", "PYTEST_VERSION", "HERMES_TEST_ISOLATION")
-#: The live-DB guard's escape hatch (hermes_state_guard._STATE_DB_GUARD_BYPASS_ENV), honored here too.
-_LIVE_HOME_GUARD_BYPASS_ENV = "HERMES_STATE_DB_GUARD_BYPASS"
-_LIVE_HERMES_ROOTS: frozenset[Path] | None = None
+#: This guard's escape hatch, and the live-DB guard's (hermes_state_guard._STATE_DB_GUARD_BYPASS_ENV):
+#: a test that needs the live database needs the live home too. Tests of the DB guard alone set the first.
+_LIVE_HOME_GUARD_BYPASS_ENVS = ("HERMES_LIVE_HOME_GUARD_BYPASS", "HERMES_STATE_DB_GUARD_BYPASS")
+_LIVE_HERMES_ROOTS: frozenset[str] | None = None
+
+
+def _path_key(path: str | Path) -> str:
+    """Absolute spelling of *path*, case-folded where the filesystem usually ignores case."""
+    key = os.path.abspath(path)
+    return key.casefold() if sys.platform in ("darwin", "win32") else key
 
 
 def _refuse_live_home_in_tests(home: Path) -> Path:
@@ -247,16 +255,21 @@ def _refuse_live_home_in_tests(home: Path) -> Path:
     tests/conftest.py sandboxes HERMES_HOME only for files under ``tests/``. A test written anywhere
     else ran without it and overwrote the live ``config.yaml`` through ``get_hermes_home()``.
     """
-    if os.environ.get(_LIVE_HOME_GUARD_BYPASS_ENV) or not any(os.environ.get(name) for name in _TEST_PROCESS_ENV):
+    if any(os.environ.get(name) for name in _LIVE_HOME_GUARD_BYPASS_ENVS):
+        return home
+    # Env only: ancestry would also catch existing tests whose children run without HERMES_HOME by
+    # design; the live-DB guard covers those children.
+    if not any(os.environ.get(name) for name in _TEST_PROCESS_ENV):
         return home
     global _LIVE_HERMES_ROOTS
     if _LIVE_HERMES_ROOTS is None:
         root = _platform_default_hermes_home(os.environ, _account_home)
-        _LIVE_HERMES_ROOTS = frozenset({Path(os.path.abspath(root)), root.resolve()})
+        _LIVE_HERMES_ROOTS = frozenset({_path_key(root), _path_key(root.resolve())})
     # No filesystem call here: this runs under every registry lookup (see hermes_home_key).
-    candidate = Path(os.path.abspath(home))
+    candidate = _path_key(home)
+    parent = os.path.dirname(candidate)
     if candidate in _LIVE_HERMES_ROOTS or (
-        candidate.parent.name == "profiles" and candidate.parent.parent in _LIVE_HERMES_ROOTS
+        os.path.basename(parent) == "profiles" and os.path.dirname(parent) in _LIVE_HERMES_ROOTS
     ):
         raise RuntimeError(
             f"A test process resolved the live Hermes home {home}. "
@@ -333,10 +346,10 @@ def get_default_hermes_root(*, home: str | Path | None = None) -> Path:
     memo_key = (str(native_home), str(env_path) if env_path is not None else "")
     memo = _default_hermes_root_memo
     if memo is not None and memo[:2] == memo_key:
-        return memo[2]
+        return _refuse_live_home_in_tests(memo[2])
     result = _hermes_root_of(native_home, env_path)
     _default_hermes_root_memo = (*memo_key, result)
-    return result
+    return _refuse_live_home_in_tests(result)
 
 
 # Tombstone lives beside the profile dir (not inside) so a stale mkdir or rmtree cannot erase it.
