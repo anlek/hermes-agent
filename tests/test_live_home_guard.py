@@ -13,7 +13,7 @@ def live_root(tmp_path, monkeypatch):
     """Stand in tmp_path for the OS account home, so the account's live root is tmp_path/.hermes."""
     monkeypatch.setattr(hermes_constants, "_account_home", lambda: tmp_path)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr(hermes_constants, "_LIVE_HERMES_ROOTS", None, raising=False)
+    monkeypatch.setattr(hermes_constants, "_LIVE_HERMES_ROOTS", None)
     monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
     for name in ("HERMES_DATA_DIR_SUFFIX", "HERMES_LIVE_HOME_GUARD_BYPASS", "HERMES_STATE_DB_GUARD_BYPASS"):
         monkeypatch.delenv(name, raising=False)
