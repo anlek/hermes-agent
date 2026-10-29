@@ -39,7 +39,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _CHILD_PROBE = """
 import sys
 sys.path.insert(0, {repo!r})
-import hermes_state
+try:
+    import hermes_state
+except RuntimeError:  # the home guard refused the live root before the DB guard was reached
+    print("REFUSED")
+    sys.exit(0)
 
 root = hermes_state._real_platform_state_root()
 if root is None:

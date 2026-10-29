@@ -75,7 +75,8 @@ class TestProductionPathRefused:
         monkeypatch.setattr(
             hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
         )
-        with pytest.raises(RuntimeError, match="live-system guard"):
+        # Either guard may refuse first: the home guard when the path is resolved, the DB guard on open.
+        with pytest.raises(RuntimeError, match="live-system guard|live Hermes home"):
             SessionDB()
 
 
@@ -169,7 +170,8 @@ class TestSubprocessChildCovered:
             check=False,
         )
         assert proc.returncode != 0
-        assert "live-system guard" in proc.stderr
+        # The home guard refuses at import, before the DB guard is reached.
+        assert "live-system guard" in proc.stderr or "live Hermes home" in proc.stderr
 
     def test_child_with_tmp_hermes_home_succeeds(self, tmp_path):
         """Same child, hermetic HERMES_HOME: must work — no false positive."""

@@ -234,6 +234,37 @@ def reset_hermes_home_key_cache() -> None:
     _HOME_KEY_CACHE.clear()
 
 
+#: Set in a test process: pytest's own variables, and the marker tests/conftest.py exports.
+_TEST_PROCESS_ENV = ("PYTEST_CURRENT_TEST", "PYTEST_VERSION", "HERMES_TEST_ISOLATION")
+#: The live-DB guard's escape hatch (hermes_state_guard._STATE_DB_GUARD_BYPASS_ENV), honored here too.
+_LIVE_HOME_GUARD_BYPASS_ENV = "HERMES_STATE_DB_GUARD_BYPASS"
+_LIVE_HERMES_ROOTS: frozenset[Path] | None = None
+
+
+def _refuse_live_home_in_tests(home: Path) -> Path:
+    """Return *home*, or raise when a test process resolves the account's live Hermes home or one of its profiles.
+
+    tests/conftest.py sandboxes HERMES_HOME only for files under ``tests/``. A test written anywhere
+    else ran without it and overwrote the live ``config.yaml`` through ``get_hermes_home()``.
+    """
+    if os.environ.get(_LIVE_HOME_GUARD_BYPASS_ENV) or not any(os.environ.get(name) for name in _TEST_PROCESS_ENV):
+        return home
+    global _LIVE_HERMES_ROOTS
+    if _LIVE_HERMES_ROOTS is None:
+        root = _platform_default_hermes_home(os.environ, _account_home)
+        _LIVE_HERMES_ROOTS = frozenset({Path(os.path.abspath(root)), root.resolve()})
+    # No filesystem call here: this runs under every registry lookup (see hermes_home_key).
+    candidate = Path(os.path.abspath(home))
+    if candidate in _LIVE_HERMES_ROOTS or (
+        candidate.parent.name == "profiles" and candidate.parent.parent in _LIVE_HERMES_ROOTS
+    ):
+        raise RuntimeError(
+            f"A test process resolved the live Hermes home {home}. "
+            "Set HERMES_HOME to a temporary directory, or put the test under tests/."
+        )
+    return home
+
+
 def get_process_hermes_home() -> Path:
     """Hermes home of the running process, ignoring task overrides.
 
@@ -243,7 +274,7 @@ def get_process_hermes_home() -> Path:
     :func:`get_routing_process_hermes_home` instead (#119242).
     """
     val = os.environ.get("HERMES_HOME", "").strip()
-    return _expand_hermes_home(val) if val else _get_platform_default_hermes_home()
+    return _refuse_live_home_in_tests(_expand_hermes_home(val) if val else _get_platform_default_hermes_home())
 
 
 # Host-pinned identity of the profile this process serves as its own (None: follow HERMES_HOME).
